@@ -1,5 +1,4 @@
-import os
-import subprocess
+import os, re, subprocess
 from pathlib import Path
 
 try:
@@ -19,35 +18,26 @@ if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"), auth_token=os.getenv("ANTHROPIC_API_KEY"))
+client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
 
-def run_bash(command: str) -> str:
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any(d in command for d in dangerous):
-        return "Error: Dangerous command blocked"
-    try:
-        r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                           capture_output=True, text=True, errors="replace",
-                           timeout=120)
-        out = (r.stdout + r.stderr).strip()
-        return out[:50000] if out else "(no output)"
-    except subprocess.TimeoutExpired:
-        return "Error: Timeout (120s)"
-    except (FileNotFoundError, OSError) as e:
-        return f"Error: {e}"
-
-
-# -- four tools --
-
+# -- tool implementations --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
+def run_bash(command: str) -> str:
+    try:
+        r = subprocess.run(command, shell=True, cwd=WORKDIR,
+                           capture_output=True, text=True, errors="replace", timeout=120)
+        out = (r.stdout + r.stderr).strip()
+        return out[:50000] if out else "(no output)"
+    except subprocess.TimeoutExpired:
+        return "Error: Timeout (120s)"
 
 def run_read(path: str, limit: int | None = None) -> str:
     try:
@@ -58,7 +48,6 @@ def run_read(path: str, limit: int | None = None) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-
 def run_write(path: str, content: str) -> str:
     try:
         file_path = safe_path(path)
@@ -67,7 +56,6 @@ def run_write(path: str, content: str) -> str:
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
-
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
@@ -80,13 +68,11 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-
 def run_glob(pattern: str) -> str:
     import glob as g
     try:
         matches = sorted({
-            match for match in g.glob(
-                pattern, root_dir=WORKDIR, recursive=True)
+            match for match in g.glob(pattern, root_dir=WORKDIR, recursive=True)
             if (WORKDIR / match).resolve().is_relative_to(WORKDIR)
         })
         shown = matches[:200]
@@ -95,9 +81,6 @@ def run_glob(pattern: str) -> str:
         return "\n".join(shown) if shown else "(no matches)"
     except Exception as e:
         return f"Error: {e}"
-
-
-# -- tool definitions --
 
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -112,12 +95,91 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
 ]
 
-# -- dispatch map --
-
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob,
 }
+
+# -- hook system --
+HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
+
+def register_hook(event: str, callback):
+    HOOKS[event].append(callback)
+
+def trigger_hooks(event: str, *args):
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:
+            return result
+    return None
+
+# Gate 1: Hard deny list - always forbidden
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
+DESTRUCTIVE_COMMAND_WORD = re.compile(
+    r"(?i)(?:^|[;&|()\n])\s*(?:rm|del)(?=\s|$|[;&|()])"
+)
+DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
+
+def contains_destructive_command(command: str) -> bool:
+    return bool(DESTRUCTIVE_COMMAND_WORD.search(command))
+
+def permission_hook(block):
+    """PreToolUse: s03 check_permission() logic moved here."""
+    if block.name == "bash":
+        command = block.input.get("command", "")
+        for pattern in DENY_LIST:
+            if pattern in command:
+                print(f"\n\033[31m[blocked] '{pattern}'\033[0m")
+                return "Permission denied by deny list"
+        if contains_destructive_command(command) or any(
+            kw in command for kw in DESTRUCTIVE
+        ):
+            print(f"\n\033[33m[permission] Potentially destructive command\033[0m")
+            print(f"    Tool: {block.name}({block.input})")
+            choice = input("    Allow? [y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                return "Permission denied by user"
+    if block.name in ["read_file", "write_file", "edit_file"]:
+        path = block.input.get("path", "")
+        if not safe_path(path).is_relative_to(WORKDIR):
+            print(f"\n\033[33m[permission] Access outside workspace\033[0m")
+            print(f"   Tool: {block.name}({block.input})")
+            choice = input("   Allow? [y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                return "Permission denied by user"
+    return None
+
+def log_hook(block):
+    """PreToolUse: log every tool call."""
+    args_preview = str(list(block.input.values())[:2])[:60]
+    print(f"\033[90m[HOOK] {block.name}({args_preview})\033[0m")
+    return None
+
+def large_output_hook(block, output):
+    """PostToolUse: warn on large output."""
+    if len(str(output)) > 100000:
+        print(f"\033[33m[HOOK] Large output from {block.name}: {len(str(output))} chars\033[0m")
+    return None
+
+# UserPromptSubmit hook: log user input before it reaches the LLM
+def context_inject_hook(query: str):
+    print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
+    return None
+
+def summary_hook(messages: list):
+    tool_count = sum(1 for m in messages
+                     for b in (m.get("content") if isinstance(m.get("content"), list) else [])
+                     if isinstance(b, dict) and b.get("type") == "tool_result")
+    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+    return None
+
+register_hook("UserPromptSubmit", context_inject_hook)
+register_hook("PreToolUse", permission_hook)
+register_hook("PreToolUse", log_hook)
+register_hook("PostToolUse", large_output_hook)
+register_hook("Stop", summary_hook)
+
+# -- Agent loop --
 
 def agent_loop(messages: list):
     while True:
@@ -131,14 +193,25 @@ def agent_loop(messages: list):
             block for block in response.content if block.type == "tool_use"
         ]
         if not tool_calls:
+            force = trigger_hooks("Stop", messages)
+            if force:
+                messages.append({"role": "user", "content": force})
+                continue
             return
 
         results = []
         for block in tool_calls:
-            print(f"\033[33m> {block.name}\033[0m")
+            blocked = trigger_hooks("PreToolUse", block)
+            if blocked:
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": str(blocked)})
+                continue
+
             handler = TOOL_HANDLERS.get(block.name)
             output = handler(**block.input) if handler else f"Unknown: {block.name}"
-            print(str(output)[:200])
+
+            trigger_hooks("PostToolUse", block, output)
+            
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
 
         messages.append({"role": "user", "content": results})
@@ -151,11 +224,12 @@ if __name__ == "__main__":
     while True:
         try:
             # \001/\002 tell Readline the ANSI escapes have zero display width.
-            query = input("\001\033[36m\002s02 >> \001\033[0m\002")
+            query = input("\001\033[36m\002s03 >> \001\033[0m\002")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
         for block in history[-1]["content"]:
